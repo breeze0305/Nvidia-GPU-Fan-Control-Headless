@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# =========================================================
+# NVIDIA GPU Fan Controller for Headless Ubuntu
+# =========================================================
+
+DISPLAY_NUM=":0"
+XORG_CONFIG="/etc/X11/xorg.conf"
+XORG_LOG="/var/log/gpufan-xorg.log"
+XORG_PIDFILE="/run/gpufan-xorg.pid"
+XAUTH_FILE="/run/gpufan.Xauthority"
+
+if [[ $EUID -ne 0 ]]; then
+    exec sudo -- "$0" "$@"
+fi
+
+die() {
+    echo "[ERROR] $*" >&2
+    exit 1
+}
+
+check_commands() {
+    command -v nvidia-settings >/dev/null 2>&1 \
+        || die "找不到 nvidia-settings"
+
+    command -v nvidia-smi >/dev/null 2>&1 \
+        || die "找不到 nvidia-smi"
+
+    command -v Xorg >/dev/null 2>&1 \
+        || die "找不到 Xorg"
+
+    command -v xauth >/dev/null 2>&1 \
+        || die "找不到 xauth，請執行：sudo apt install xauth"
+
+    command -v mcookie >/dev/null 2>&1 \
+        || die "找不到 mcookie"
+}
+
+get_root_xorg_pid() {
+    ps -eo pid=,user=,args= | \
+        awk '$2 == "root" && $0 ~ /Xorg :0([[:space:]]|$)/ {print $1; exit}'
+}
+
+nvsettings() {
+    if [[ -f "$XAUTH_FILE" ]]; then
+        env \
+            DISPLAY="$DISPLAY_NUM" \
+            XAUTHORITY="$XAUTH_FILE" \
+            nvidia-settings -c "$DISPLAY_NUM" "$@"
+    else
+        DISPLAY="$DISPLAY_NUM" \
+            nvidia-settings -c "$DISPLAY_NUM" "$@"
+    fi
+}
+
+nvsettings_quiet() {
+    nvsettings "$@" >/dev/null 2>&1
+}
+
+detect_fans() {
+    FANS=()
+
+    mapfile -t FANS < <(
+        nvsettings -q fans 2>/dev/null |
+        sed -n 's/.*\[fan:\([0-9]\+\)\].*/\1/p' |
+        sort -nu
+    )
+
+    if [[ ${#FANS[@]} -eq 0 ]]; then
+        die "沒有偵測到可控制的 NVIDIA 風扇"
+    fi
+}
+
+create_xauthority() {
+    rm -f "$XAUTH_FILE"
+
+    touch "$XAUTH_FILE"
+    chmod 600 "$XAUTH_FILE"
+
+    xauth -f "$XAUTH_FILE" add \
+        "$DISPLAY_NUM" . "$(mcookie)"
+}
+
+start_xorg() {
+    local pid
+
+    pid="$(get_root_xorg_pid || true)"
+
+    if [[ -n "$pid" ]] && nvsettings_quiet -q gpus; then
+        echo "[OK] Root Xorg 已經運作中 (PID $pid)"
+        return
+    fi
+
+    echo "[INFO] 停止 GDM..."
+
+    systemctl stop gdm3.service 2>/dev/null || \
+    systemctl stop gdm.service 2>/dev/null || true
+
+    for _ in {1..20}; do
+        if ! pgrep -x Xorg >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.5
+    done
+
+    if pgrep -x Xorg >/dev/null 2>&1; then
+        echo
+        echo "[ERROR] 系統還有 Xorg 正在執行："
+        pgrep -a Xorg
+        echo
+        echo "請先確認沒有其他桌面/X Server 使用中。"
+        exit 1
+    fi
+
+    if [[ ! -f "$XORG_CONFIG" ]]; then
+        die "找不到 $XORG_CONFIG"
+    fi
+
+    echo "[INFO] 建立 Xauthority..."
+    create_xauthority
+
+    echo "[INFO] 啟動 root Xorg ${DISPLAY_NUM}..."
+
+    nohup "$(command -v Xorg)" "$DISPLAY_NUM" \
+        -config "$XORG_CONFIG" \
+        -auth "$XAUTH_FILE" \
+        -noreset \
+        -nolisten tcp \
+        > "$XORG_LOG" 2>&1 &
+
+    pid=$!
+    echo "$pid" > "$XORG_PIDFILE"
+
+    for _ in {1..30}; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo
+            echo "[ERROR] Xorg 提前終止"
+            echo
+            tail -80 "$XORG_LOG" || true
+            exit 1
+        fi
+
+        if nvsettings_quiet -q gpus; then
+            echo "[OK] Xorg 已啟動 (PID $pid)"
+            return
+        fi
+
+        sleep 0.5
+    done
+
+    echo
+    echo "[ERROR] Xorg 啟動逾時"
+    echo
+    echo "最後 80 行 Log："
+    tail -80 "$XORG_LOG" || true
+    exit 1
+}
+
+set_fan_speed() {
+    local speed="$1"
+    local output
+
+    if [[ ! "$speed" =~ ^[0-9]+$ ]]; then
+        die "風扇速度必須是 0~100 的整數"
+    fi
+
+    if (( speed < 0 || speed > 100 )); then
+        die "風扇速度必須介於 0~100"
+    fi
+
+    start_xorg
+    detect_fans
+
+    echo "[INFO] 偵測到 ${#FANS[@]} 個可控制風扇：${FANS[*]}"
+    echo "[INFO] 啟用 NVIDIA 手動風扇控制..."
+
+    if ! output="$(
+        nvsettings -a '[gpu:0]/GPUFanControlState=1' 2>&1
+    )"; then
+        echo "$output"
+        die "無法啟用手動風扇控制"
+    fi
+
+    for fan in "${FANS[@]}"; do
+        echo "[INFO] Fan ${fan} -> ${speed}%"
+
+        if ! output="$(
+            nvsettings -a "[fan:${fan}]/GPUTargetFanSpeed=${speed}" 2>&1
+        )"; then
+            echo "$output"
+            die "Fan ${fan} 設定失敗"
+        fi
+    done
+
+    echo
+    echo "[OK] ${#FANS[@]} 個 NVIDIA 風扇已設定為 ${speed}%"
+
+    show_status
+}
+
+set_auto() {
+    local output
+
+    start_xorg
+
+    echo "[INFO] 恢復 NVIDIA 自動風扇控制..."
+
+    if ! output="$(
+        nvsettings -a '[gpu:0]/GPUFanControlState=0' 2>&1
+    )"; then
+        echo "$output"
+        die "無法恢復自動風扇控制"
+    fi
+
+    echo
+    echo "[OK] 已恢復 NVIDIA 自動風扇控制"
+
+    show_status
+}
+
+show_status() {
+    echo
+    echo "========================================"
+    echo " GPU"
+    echo "========================================"
+
+    nvidia-smi \
+        --query-gpu=name,temperature.gpu,fan.speed,power.draw \
+        --format=csv,noheader 2>/dev/null || true
+
+    echo
+    echo "========================================"
+    echo " Fan Control"
+    echo "========================================"
+
+    if ! nvsettings_quiet -q gpus; then
+        echo "Xorg / NV-CONTROL 尚未啟動"
+        return
+    fi
+
+    detect_fans
+
+    local state
+    state="$(
+        nvsettings -t \
+            -q '[gpu:0]/GPUFanControlState' \
+            2>/dev/null || echo "?"
+    )"
+
+    case "$state" in
+        1)
+            echo "模式：手動"
+            ;;
+        0)
+            echo "模式：自動"
+            ;;
+        *)
+            echo "模式：未知 ($state)"
+            ;;
+    esac
+
+    echo
+    echo "偵測到風扇：${FANS[*]}"
+    echo
+
+    for fan in "${FANS[@]}"; do
+        local target
+        local rpm
+
+        target="$(
+            nvsettings -t \
+                -q "[fan:${fan}]/GPUTargetFanSpeed" \
+                2>/dev/null || echo "?"
+        )"
+
+        rpm="$(
+            nvsettings -t \
+                -q "[fan:${fan}]/GPUCurrentFanSpeedRPM" \
+                2>/dev/null || echo "?"
+        )"
+
+        echo "Fan ${fan}: Target=${target}%  RPM=${rpm}"
+    done
+}
+
+stop_xorg() {
+    echo "[INFO] 恢復 NVIDIA 自動風扇控制..."
+
+    if nvsettings_quiet -q gpus; then
+        nvsettings \
+            -a '[gpu:0]/GPUFanControlState=0' \
+            >/dev/null 2>&1 || true
+    fi
+
+    if [[ -f "$XORG_PIDFILE" ]]; then
+        local pid
+        pid="$(cat "$XORG_PIDFILE")"
+
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "[INFO] 關閉 gpufan Xorg (PID $pid)..."
+
+            kill "$pid" 2>/dev/null || true
+
+            for _ in {1..20}; do
+                if ! kill -0 "$pid" 2>/dev/null; then
+                    break
+                fi
+                sleep 0.25
+            done
+        fi
+
+        rm -f "$XORG_PIDFILE"
+    else
+        echo "[INFO] 沒有找到 gpufan 的 Xorg PID file"
+    fi
+
+    rm -f "$XAUTH_FILE"
+
+    echo "[OK] gpufan Xorg 已停止"
+}
+
+restore_gui() {
+    stop_xorg
+
+    echo "[INFO] 啟動 GDM..."
+
+    systemctl start gdm3.service 2>/dev/null || \
+    systemctl start gdm.service
+
+    echo "[OK] GDM 已啟動"
+}
+
+usage() {
+    cat <<EOF
+
+NVIDIA GPU Fan Controller for Headless Ubuntu
+
+使用方法：
+
+  gpufan 99
+      固定所有 NVIDIA 可控制風扇為 99%
+
+  gpufan 80
+      固定所有風扇為 80%
+
+  gpufan auto
+      恢復 NVIDIA 自動風扇控制
+
+  gpufan status
+      查看 GPU / Fan 狀態
+
+  gpufan stop
+      恢復自動風扇並停止 root Xorg
+
+  gpufan gui
+      恢復自動風扇、停止 root Xorg、重新啟動 Ubuntu GDM GUI
+
+EOF
+}
+
+check_commands
+
+case "${1:-}" in
+    auto)
+        set_auto
+        ;;
+    status)
+        show_status
+        ;;
+    stop)
+        stop_xorg
+        ;;
+    gui)
+        restore_gui
+        ;;
+    "")
+        usage
+        ;;
+    *)
+        set_fan_speed "$1"
+        ;;
+esac
