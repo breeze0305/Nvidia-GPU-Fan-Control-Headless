@@ -24,9 +24,11 @@ It uses `nvidia-settings` with a dedicated root Xorg session, automatically dete
 - Can restore the Ubuntu graphical login screen with one command
 - No need to hard-code the number of GPU fans
 
-Tested with:
+Tested with NVIDIA GPUs across multiple RTX generations:
 
+- NVIDIA GeForce RTX 2080 Ti
 - NVIDIA GeForce RTX 3090
+- NVIDIA GeForce RTX 4090
 - NVIDIA GeForce RTX 5090
 
 The number of controllable `fan:X` targets depends on the GPU model and NVIDIA driver.
