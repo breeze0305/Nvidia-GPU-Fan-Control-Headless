@@ -12,6 +12,10 @@ It uses `nvidia-settings` with a dedicated root Xorg session, automatically dete
 
 - Designed for headless Ubuntu / SSH servers
 - Automatically detects available NVIDIA fan controllers
+- Automatically generates a minimal headless `/etc/X11/xorg.conf` when one does not exist
+- Automatically detects the PCI Bus ID of `gpu:0`
+- Enables `Coolbits=4` and `AllowEmptyInitialConfiguration` in the generated Xorg config
+- Never overwrites an existing `/etc/X11/xorg.conf`
 - Set all detected GPU fans to a fixed speed
 - Restore NVIDIA automatic fan control
 - View GPU temperature, fan percentage, power draw, target fan speed, and RPM
@@ -36,7 +40,6 @@ The number of controllable `fan:X` targets depends on the GPU model and NVIDIA d
 - Xorg
 - `xauth`
 - `mcookie`
-- NVIDIA Xorg configuration with fan control enabled through `Coolbits`
 
 Install the required packages if needed:
 
@@ -45,21 +48,23 @@ sudo apt update
 sudo apt install nvidia-settings xserver-xorg xauth
 ```
 
-Your NVIDIA device section in `/etc/X11/xorg.conf` should include:
+### Xorg configuration
+
+You do **not** need to manually create `/etc/X11/xorg.conf` on a fresh headless system.
+
+If the file does not exist, `gpufan` automatically:
+
+1. Reads the PCI Bus ID of `gpu:0` from `nvidia-smi`
+2. Converts it to the Xorg `BusID` format
+3. Creates a minimal headless Xorg configuration
+4. Enables:
 
 ```text
 Option "Coolbits" "4"
+Option "AllowEmptyInitialConfiguration" "True"
 ```
 
-Example:
-
-```text
-Section "Device"
-    Identifier "Device0"
-    Driver "nvidia"
-    Option "Coolbits" "4"
-EndSection
-```
+If `/etc/X11/xorg.conf` already exists, `gpufan` will **not overwrite it**. The existing NVIDIA device configuration should have `Coolbits=4` enabled for manual fan control.
 
 ## Installation
 
@@ -87,6 +92,14 @@ Expected output:
 ```text
 /usr/local/bin/gpufan
 ```
+
+You can now immediately run:
+
+```bash
+gpufan 99
+```
+
+On the first run, a headless Xorg configuration will be generated automatically if one is missing.
 
 ## Usage
 
@@ -126,27 +139,32 @@ Restore the Ubuntu GUI / GDM:
 gpufan gui
 ```
 
-## Example
+## First-run Example
 
 ```text
 $ gpufan 99
 
-[INFO] 停止 GDM...
-[INFO] 建立 Xauthority...
-[INFO] 啟動 root Xorg :0...
-[OK] Xorg 已啟動
-[INFO] 偵測到 2 個可控制風扇：0 1
-[INFO] 啟用 NVIDIA 手動風扇控制...
+[INFO] /etc/X11/xorg.conf not found
+[INFO] Detecting GPU 0 PCI Bus and creating a headless Xorg configuration...
+[OK] Created /etc/X11/xorg.conf
+[INFO] GPU: NVIDIA GeForce RTX 3090
+[INFO] PCI Bus: 00000000:01:00.0 -> PCI:1:0:0
+[INFO] Stopping GDM...
+[INFO] Creating Xauthority...
+[INFO] Starting root Xorg :0...
+[OK] Xorg started
+[INFO] Detected 2 controllable fans: 0 1
+[INFO] Enabling NVIDIA manual fan control...
 [INFO] Fan 0 -> 99%
 [INFO] Fan 1 -> 99%
 
-[OK] 2 個 NVIDIA 風扇已設定為 99%
+[OK] 2 NVIDIA fans have been set to 99%
 ```
 
 A GPU exposing three independent fan targets may instead show:
 
 ```text
-[INFO] 偵測到 3 個可控制風扇：0 1 2
+Detected 3 controllable fans: 0 1 2
 ```
 
 ## How It Works
@@ -155,16 +173,20 @@ On some Ubuntu systems, the Xorg session started by GDM can read NVIDIA fan info
 
 This utility works around that behavior by:
 
-1. Stopping GDM
-2. Starting a dedicated Xorg session as root
-3. Connecting `nvidia-settings` to that X server
-4. Enabling `GPUFanControlState`
-5. Detecting available `fan:X` targets
-6. Setting every detected fan target to the requested speed
+1. Creating a minimal headless Xorg configuration when one is missing
+2. Detecting the PCI Bus ID of `gpu:0`
+3. Stopping GDM
+4. Starting a dedicated Xorg session as root
+5. Connecting `nvidia-settings` to that X server
+6. Enabling `GPUFanControlState`
+7. Detecting available `fan:X` targets
+8. Setting every detected fan target to the requested speed
 
 ## Important Notes
 
 - The script currently controls `gpu:0`.
+- Automatic Xorg config generation also targets `gpu:0`.
+- Existing `/etc/X11/xorg.conf` files are never overwritten automatically.
 - The physical number of fans on a graphics card may differ from the number of fan controllers exposed by the NVIDIA driver.
 - Running `gpufan <speed>` may stop the current Ubuntu graphical desktop because GDM is stopped before the dedicated root Xorg session starts.
 - Use `gpufan gui` to stop the dedicated Xorg session and restore GDM.
