@@ -35,7 +35,7 @@ The number of controllable `fan:X` targets depends on the GPU model and NVIDIA d
 
 ## Requirements
 
-- Ubuntu
+- Ubuntu 20.04 - 24.04
 - NVIDIA proprietary driver
 - `nvidia-smi`
 - `nvidia-settings`
