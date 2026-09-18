@@ -24,9 +24,11 @@
 - 可透過單一指令恢復 Ubuntu 圖形登入介面
 - 不需要手動指定 `fan:0`、`fan:1`、`fan:2` 的數量
 
-目前已測試：
+目前已實機測試多個 RTX 世代的 NVIDIA GPU：
 
+- NVIDIA GeForce RTX 2080 Ti
 - NVIDIA GeForce RTX 3090
+- NVIDIA GeForce RTX 4090
 - NVIDIA GeForce RTX 5090
 
 實際可控制的 `fan:X` 數量會依顯示卡型號與 NVIDIA 驅動而不同。
