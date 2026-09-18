@@ -35,7 +35,7 @@
 
 ## 系統需求
 
-- Ubuntu
+- Ubuntu 20.04 ～ 24.04
 - NVIDIA 官方驅動
 - `nvidia-smi`
 - `nvidia-settings`
