@@ -1,28 +1,31 @@
-# NVIDIA GPU Fan Controller for Ubuntu
+# NVIDIA GPU Fan Control for Headless Ubuntu
 
 [繁體中文](README.zh-TW.md)
 
-A simple Bash utility for controlling NVIDIA GPU fan speeds on Ubuntu using `nvidia-settings`.
+A lightweight Bash utility for controlling NVIDIA GPU fan speeds on **headless Ubuntu servers** over SSH.
 
-It automatically detects the fan controllers exposed by the NVIDIA driver, starts a root Xorg session when needed, and supports both manual fan speed control and restoring NVIDIA automatic fan control.
+It uses `nvidia-settings` with a dedicated root Xorg session, automatically detects the fan controllers exposed by the NVIDIA driver, and supports fixed fan speeds, status monitoring, restoring automatic fan control, and restoring GDM when needed.
+
+> Designed primarily for headless / SSH Ubuntu systems where NVIDIA fan control through the normal GDM Xorg session may fail.
 
 ## Features
 
+- Designed for headless Ubuntu / SSH servers
 - Automatically detects available NVIDIA fan controllers
 - Set all detected GPU fans to a fixed speed
 - Restore NVIDIA automatic fan control
-- View GPU temperature, fan speed, power draw, target fan speed, and RPM
-- Starts a root Xorg session automatically when required
+- View GPU temperature, fan percentage, power draw, target fan speed, and RPM
+- Automatically starts a dedicated root Xorg session when required
 - Stops GDM before starting the dedicated Xorg session
-- Can restore the Ubuntu graphical login screen
-- Works well for headless / SSH Ubuntu machines
+- Can restore the Ubuntu graphical login screen with one command
+- No need to hard-code the number of GPU fans
 
-Tested with GPUs such as:
+Tested with:
 
 - NVIDIA GeForce RTX 3090
 - NVIDIA GeForce RTX 5090
 
-The number of controllable fan channels depends on the GPU and NVIDIA driver.
+The number of controllable `fan:X` targets depends on the GPU model and NVIDIA driver.
 
 ## Requirements
 
@@ -33,16 +36,16 @@ The number of controllable fan channels depends on the GPU and NVIDIA driver.
 - Xorg
 - `xauth`
 - `mcookie`
-- NVIDIA Xorg configuration with `Coolbits` fan control enabled
+- NVIDIA Xorg configuration with fan control enabled through `Coolbits`
 
-Install required packages if needed:
+Install the required packages if needed:
 
 ```bash
 sudo apt update
 sudo apt install nvidia-settings xserver-xorg xauth
 ```
 
-Your NVIDIA device section in `/etc/X11/xorg.conf` should contain:
+Your NVIDIA device section in `/etc/X11/xorg.conf` should include:
 
 ```text
 Option "Coolbits" "4"
@@ -60,19 +63,20 @@ EndSection
 
 ## Installation
 
-Download or copy the `gpufan` script to:
+Clone the repository:
 
 ```bash
-/usr/local/bin/gpufan
+git clone https://github.com/breeze0305/Nvidia-GPU-Fan-Control-Headless.git
+cd Nvidia-GPU-Fan-Control-Headless
 ```
 
-Then make it executable:
+Install the script system-wide:
 
 ```bash
-sudo chmod +x /usr/local/bin/gpufan
+sudo install -m 0755 gpufan /usr/local/bin/gpufan
 ```
 
-Verify:
+Verify the installation:
 
 ```bash
 which gpufan
@@ -98,7 +102,7 @@ Set all detected GPU fans to 80%:
 gpufan 80
 ```
 
-View current status:
+View the current GPU and fan status:
 
 ```bash
 gpufan status
@@ -110,7 +114,7 @@ Restore NVIDIA automatic fan control:
 gpufan auto
 ```
 
-Restore automatic fan control and stop the root Xorg session:
+Restore automatic fan control and stop the dedicated root Xorg session:
 
 ```bash
 gpufan stop
@@ -127,52 +131,48 @@ gpufan gui
 ```text
 $ gpufan 99
 
-[INFO] Stopping GDM...
-[INFO] Creating Xauthority...
-[INFO] Starting root Xorg :0...
-[OK] Xorg started
-[INFO] Detected 2 controllable fans: 0 1
-[INFO] Enabling NVIDIA manual fan control...
+[INFO] 停止 GDM...
+[INFO] 建立 Xauthority...
+[INFO] 啟動 root Xorg :0...
+[OK] Xorg 已啟動
+[INFO] 偵測到 2 個可控制風扇：0 1
+[INFO] 啟用 NVIDIA 手動風扇控制...
 [INFO] Fan 0 -> 99%
 [INFO] Fan 1 -> 99%
 
-[OK] 2 NVIDIA fans have been set to 99%
+[OK] 2 個 NVIDIA 風扇已設定為 99%
 ```
 
-A GPU with three exposed fan controllers may instead show:
+A GPU exposing three independent fan targets may instead show:
 
 ```text
-Detected 3 controllable fans: 0 1 2
+[INFO] 偵測到 3 個可控制風扇：0 1 2
 ```
 
 ## How It Works
 
-On some Ubuntu systems, `nvidia-settings` can read fan information through the GDM Xorg session but fails to write `GPUTargetFanSpeed`.
+On some Ubuntu systems, the Xorg session started by GDM can read NVIDIA fan information but fails when writing `GPUTargetFanSpeed`.
 
-This utility works around that situation by:
+This utility works around that behavior by:
 
 1. Stopping GDM
-2. Starting Xorg as root
+2. Starting a dedicated Xorg session as root
 3. Connecting `nvidia-settings` to that X server
 4. Enabling `GPUFanControlState`
 5. Detecting available `fan:X` targets
-6. Setting each detected fan to the requested speed
+6. Setting every detected fan target to the requested speed
 
-## Notes
+## Important Notes
 
-- This script currently controls `gpu:0`.
+- The script currently controls `gpu:0`.
 - The physical number of fans on a graphics card may differ from the number of fan controllers exposed by the NVIDIA driver.
-- Running `gpufan` may stop the Ubuntu graphical desktop because GDM is stopped before the dedicated Xorg session starts.
-- Use `gpufan gui` to restore GDM.
-- Fan settings may be reset after reboot.
-- Do not assume that maximum fan speed is necessary for normal workloads.
+- Running `gpufan <speed>` may stop the current Ubuntu graphical desktop because GDM is stopped before the dedicated root Xorg session starts.
+- Use `gpufan gui` to stop the dedicated Xorg session and restore GDM.
+- Fan settings may reset after reboot.
+- This tool is intended primarily for machines managed through SSH / headless environments.
 
 ## Disclaimer
 
 Use this utility at your own risk.
 
 Manual fan control overrides the NVIDIA driver's normal fan policy. Monitor GPU temperature and hardware behavior when changing cooling settings.
-
-## License
-
-Choose a license appropriate for your project, such as MIT.
