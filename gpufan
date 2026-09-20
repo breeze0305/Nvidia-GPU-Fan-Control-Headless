@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# =========================================================
 # NVIDIA GPU Fan Controller for Headless Ubuntu
-# =========================================================
+# Multi-GPU aware: --gpu N selects the nvidia-smi GPU index.
 
 DISPLAY_NUM=":0"
-XORG_CONFIG="/etc/X11/xorg.conf"
+XORG_CONFIG="/run/gpufan-xorg.conf"
 XORG_LOG="/var/log/gpufan-xorg.log"
 XORG_PIDFILE="/run/gpufan-xorg.pid"
 XAUTH_FILE="/run/gpufan.Xauthority"
+
+GPU_INDEX=0
+ACTION=""
 
 if [[ $EUID -ne 0 ]]; then
     exec sudo -- "$0" "$@"
@@ -21,36 +23,92 @@ die() {
 }
 
 check_commands() {
-    command -v nvidia-settings >/dev/null 2>&1 \
-        || die "找不到 nvidia-settings"
-
-    command -v nvidia-smi >/dev/null 2>&1 \
-        || die "找不到 nvidia-smi"
-
-    command -v Xorg >/dev/null 2>&1 \
-        || die "找不到 Xorg"
-
-    command -v xauth >/dev/null 2>&1 \
-        || die "找不到 xauth，請執行：sudo apt install xauth"
-
-    command -v mcookie >/dev/null 2>&1 \
-        || die "找不到 mcookie"
+    command -v nvidia-settings >/dev/null 2>&1 || die "找不到 nvidia-settings"
+    command -v nvidia-smi >/dev/null 2>&1 || die "找不到 nvidia-smi"
+    command -v Xorg >/dev/null 2>&1 || die "找不到 Xorg"
+    command -v xauth >/dev/null 2>&1 || die "找不到 xauth，請執行：sudo apt install xauth"
+    command -v mcookie >/dev/null 2>&1 || die "找不到 mcookie"
 }
 
-get_root_xorg_pid() {
-    ps -eo pid=,user=,args= | \
-        awk '$2 == "root" && $0 ~ /Xorg :0([[:space:]]|$)/ {print $1; exit}'
+trim() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+parse_pci_id() {
+    local pci="$1"
+
+    if [[ ! "$pci" =~ ^([0-9A-Fa-f]{8}):([0-9A-Fa-f]{2}):([0-9A-Fa-f]{2})\.([0-7])$ ]]; then
+        die "無法解析 PCI Bus ID：$pci"
+    fi
+
+    PCI_DOMAIN_DEC=$((16#${BASH_REMATCH[1]}))
+    PCI_BUS_DEC=$((16#${BASH_REMATCH[2]}))
+    PCI_DEVICE_DEC=$((16#${BASH_REMATCH[3]}))
+    PCI_FUNC_DEC=$((16#${BASH_REMATCH[4]}))
+
+    if (( PCI_DOMAIN_DEC == 0 )); then
+        XORG_BUS_ID="PCI:${PCI_BUS_DEC}:${PCI_DEVICE_DEC}:${PCI_FUNC_DEC}"
+    else
+        XORG_BUS_ID="PCI:${PCI_BUS_DEC}@${PCI_DOMAIN_DEC}:${PCI_DEVICE_DEC}:${PCI_FUNC_DEC}"
+    fi
+}
+
+list_gpus() {
+    echo "========================================"
+    echo " NVIDIA GPUs"
+    echo "========================================"
+    nvidia-smi \
+        --query-gpu=index,name,pci.bus_id \
+        --format=csv,noheader
+}
+
+validate_gpu_index() {
+    [[ "$GPU_INDEX" =~ ^[0-9]+$ ]] || die "--gpu 必須是非負整數"
+
+    if ! nvidia-smi -i "$GPU_INDEX" --query-gpu=name --format=csv,noheader,nounits >/dev/null 2>&1; then
+        echo "[ERROR] 找不到 GPU index $GPU_INDEX"
+        echo
+        list_gpus
+        exit 1
+    fi
+}
+
+get_selected_gpu_info() {
+    SELECTED_GPU_NAME="$(
+        nvidia-smi -i "$GPU_INDEX" \
+            --query-gpu=name \
+            --format=csv,noheader,nounits 2>/dev/null |
+        head -n1
+    )"
+    SELECTED_GPU_NAME="$(trim "$SELECTED_GPU_NAME")"
+
+    SELECTED_GPU_PCI="$(
+        nvidia-smi -i "$GPU_INDEX" \
+            --query-gpu=pci.bus_id \
+            --format=csv,noheader,nounits 2>/dev/null |
+        head -n1 |
+        tr -d '[:space:]'
+    )"
+
+    [[ -n "$SELECTED_GPU_PCI" ]] || die "無法取得 GPU $GPU_INDEX 的 PCI Bus ID"
+
+    parse_pci_id "$SELECTED_GPU_PCI"
+
+    SELECTED_DOMAIN_DEC="$PCI_DOMAIN_DEC"
+    SELECTED_BUS_DEC="$PCI_BUS_DEC"
+    SELECTED_DEVICE_DEC="$PCI_DEVICE_DEC"
+    SELECTED_FUNC_DEC="$PCI_FUNC_DEC"
 }
 
 nvsettings() {
     if [[ -f "$XAUTH_FILE" ]]; then
-        env \
-            DISPLAY="$DISPLAY_NUM" \
-            XAUTHORITY="$XAUTH_FILE" \
+        env DISPLAY="$DISPLAY_NUM" XAUTHORITY="$XAUTH_FILE" \
             nvidia-settings -c "$DISPLAY_NUM" "$@"
     else
-        DISPLAY="$DISPLAY_NUM" \
-            nvidia-settings -c "$DISPLAY_NUM" "$@"
+        DISPLAY="$DISPLAY_NUM" nvidia-settings -c "$DISPLAY_NUM" "$@"
     fi
 }
 
@@ -58,138 +116,167 @@ nvsettings_quiet() {
     nvsettings "$@" >/dev/null 2>&1
 }
 
-detect_fans() {
-    FANS=()
+get_gpufan_xorg_pid() {
+    [[ -f "$XORG_PIDFILE" ]] || return
 
-    mapfile -t FANS < <(
-        nvsettings -q fans 2>/dev/null |
-        sed -n 's/.*\[fan:\([0-9]\+\)\].*/\1/p' |
-        sort -nu
-    )
+    local pid
+    pid="$(cat "$XORG_PIDFILE" 2>/dev/null || true)"
 
-    if [[ ${#FANS[@]} -eq 0 ]]; then
-        die "沒有偵測到可控制的 NVIDIA 風扇"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+        printf '%s\n' "$pid"
     fi
+}
+
+is_current_gpufan_xorg() {
+    local pid="$1"
+    local cmdline
+
+    [[ -r "/proc/$pid/cmdline" ]] || return 1
+
+    cmdline="$(tr '\0' ' ' < "/proc/$pid/cmdline")"
+
+    [[ "$cmdline" == *"Xorg $DISPLAY_NUM"* ]] &&
+    [[ "$cmdline" == *"-config $XORG_CONFIG"* ]]
 }
 
 create_xauthority() {
     rm -f "$XAUTH_FILE"
-
     touch "$XAUTH_FILE"
     chmod 600 "$XAUTH_FILE"
-
-    xauth -f "$XAUTH_FILE" add \
-        "$DISPLAY_NUM" . "$(mcookie)"
+    xauth -f "$XAUTH_FILE" add "$DISPLAY_NUM" . "$(mcookie)"
 }
 
-ensure_xorg_config() {
-    if [[ -f "$XORG_CONFIG" ]]; then
-        echo "[OK] 使用現有 Xorg 設定：$XORG_CONFIG"
+generate_xorg_config() {
+    local gpu_lines
+    local count=0
+    local idx name pci busid
 
-        if ! grep -Eiq 'Option[[:space:]]+"Coolbits"[[:space:]]+"4"' "$XORG_CONFIG"; then
-            echo "[WARN] 現有 $XORG_CONFIG 中沒有偵測到 Option \"Coolbits\" \"4\""
-            echo "[WARN] gpufan 不會自動修改既有的 Xorg 設定。若風扇控制失敗，請確認已啟用 Coolbits=4。"
-        fi
+    gpu_lines="$(
+        nvidia-smi \
+            --query-gpu=index,name,pci.bus_id \
+            --format=csv,noheader,nounits 2>/dev/null
+    )"
 
+    [[ -n "$gpu_lines" ]] || die "nvidia-smi 沒有回傳任何 NVIDIA GPU"
+
+    : > "$XORG_CONFIG"
+    chmod 600 "$XORG_CONFIG"
+
+    {
+        echo '# Automatically generated by gpufan.'
+        echo '# Runtime-only config containing all NVIDIA GPUs.'
+        echo
+        echo 'Section "ServerLayout"'
+        echo '    Identifier "Layout0"'
+    } >> "$XORG_CONFIG"
+
+    while IFS=',' read -r idx name pci; do
+        idx="$(trim "$idx")"
+        [[ -n "$idx" ]] || continue
+        echo "    Screen $count \"Screen${count}\" 0 0" >> "$XORG_CONFIG"
+        ((count+=1))
+    done <<< "$gpu_lines"
+
+    echo 'EndSection' >> "$XORG_CONFIG"
+    echo >> "$XORG_CONFIG"
+
+    count=0
+
+    while IFS=',' read -r idx name pci; do
+        idx="$(trim "$idx")"
+        name="$(trim "$name")"
+        pci="$(trim "$pci")"
+
+        [[ -n "$idx" && -n "$pci" ]] || continue
+
+        parse_pci_id "$pci"
+        busid="$XORG_BUS_ID"
+
+        {
+            echo "# nvidia-smi GPU $idx: $name"
+            echo "# PCI: $pci -> $busid"
+            echo 'Section "Device"'
+            echo "    Identifier \"Device${count}\""
+            echo '    Driver "nvidia"'
+            echo "    BusID \"$busid\""
+            echo '    Option "Coolbits" "4"'
+            echo '    Option "AllowEmptyInitialConfiguration" "True"'
+            echo 'EndSection'
+            echo
+            echo 'Section "Screen"'
+            echo "    Identifier \"Screen${count}\""
+            echo "    Device \"Device${count}\""
+            echo '    DefaultDepth 24'
+            echo '    SubSection "Display"'
+            echo '        Depth 24'
+            echo '    EndSubSection'
+            echo 'EndSection'
+            echo
+        } >> "$XORG_CONFIG"
+
+        ((count+=1))
+    done <<< "$gpu_lines"
+
+    (( count > 0 )) || die "無法產生 Xorg GPU 設定"
+
+    echo "[INFO] 已建立暫存 Headless Xorg 設定：$XORG_CONFIG"
+    echo "[INFO] 已加入 $count 張 NVIDIA GPU"
+}
+
+restore_all_auto_if_possible() {
+    nvsettings_quiet -q gpus || return
+
+    local target
+    local targets=()
+
+    mapfile -t targets < <(
+        nvsettings -q gpus 2>/dev/null |
+        sed -n 's/.*\[gpu:\([0-9]\+\)\].*/\1/p' |
+        sort -nu
+    )
+
+    for target in "${targets[@]}"; do
+        nvsettings -a "[gpu:${target}]/GPUFanControlState=0" >/dev/null 2>&1 || true
+    done
+}
+
+stop_existing_gpufan_xorg() {
+    local pid
+    pid="$(get_gpufan_xorg_pid || true)"
+
+    if [[ -z "$pid" ]]; then
+        rm -f "$XORG_PIDFILE"
         return
     fi
 
-    echo "[INFO] 找不到 $XORG_CONFIG"
-    echo "[INFO] 自動偵測 GPU 0 PCI Bus 並建立 Headless Xorg 設定..."
+    restore_all_auto_if_possible
 
-    local pci_bus_id
-    local gpu_name
-    local bus_hex
-    local device_hex
-    local function_num
-    local bus_dec
-    local device_dec
+    echo "[INFO] 關閉舊的 gpufan Xorg (PID $pid)..."
+    kill "$pid" 2>/dev/null || true
 
-    pci_bus_id="$(
-        nvidia-smi -i 0 \
-            --query-gpu=pci.bus_id \
-            --format=csv,noheader,nounits 2>/dev/null |
-        head -n1 |
-        tr -d '[:space:]'
-    )"
+    for _ in {1..20}; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.25
+    done
 
-    gpu_name="$(
-        nvidia-smi -i 0 \
-            --query-gpu=name \
-            --format=csv,noheader,nounits 2>/dev/null |
-        head -n1 |
-        sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
-    )"
-
-    if [[ -z "$pci_bus_id" ]]; then
-        die "無法從 nvidia-smi 取得 GPU 0 的 PCI Bus ID"
-    fi
-
-    if [[ ! "$pci_bus_id" =~ ^[0-9A-Fa-f]{8}:([0-9A-Fa-f]{2}):([0-9A-Fa-f]{2})\.([0-7])$ ]]; then
-        die "無法解析 PCI Bus ID：$pci_bus_id"
-    fi
-
-    bus_hex="${BASH_REMATCH[1]}"
-    device_hex="${BASH_REMATCH[2]}"
-    function_num="${BASH_REMATCH[3]}"
-
-    bus_dec=$((16#$bus_hex))
-    device_dec=$((16#$device_hex))
-
-    mkdir -p "$(dirname "$XORG_CONFIG")"
-
-    cat > "$XORG_CONFIG" <<EOF
-# Automatically generated by gpufan for Headless Ubuntu.
-# GPU: ${gpu_name:-NVIDIA GPU}
-# PCI Bus: $pci_bus_id
-#
-# This file is created only when /etc/X11/xorg.conf does not already exist.
-
-Section "ServerLayout"
-    Identifier "Layout0"
-    Screen 0 "Screen0"
-EndSection
-
-Section "Device"
-    Identifier "Device0"
-    Driver "nvidia"
-    BusID "PCI:${bus_dec}:${device_dec}:${function_num}"
-    Option "Coolbits" "4"
-    Option "AllowEmptyInitialConfiguration" "True"
-EndSection
-
-Section "Screen"
-    Identifier "Screen0"
-    Device "Device0"
-    DefaultDepth 24
-
-    SubSection "Display"
-        Depth 24
-    EndSubSection
-EndSection
-EOF
-
-    chmod 644 "$XORG_CONFIG"
-
-    echo "[OK] 已建立 $XORG_CONFIG"
-    echo "[INFO] GPU：${gpu_name:-Unknown}"
-    echo "[INFO] PCI Bus：$pci_bus_id -> PCI:${bus_dec}:${device_dec}:${function_num}"
+    rm -f "$XORG_PIDFILE" "$XAUTH_FILE" "$XORG_CONFIG"
 }
 
 start_xorg() {
     local pid
+    pid="$(get_gpufan_xorg_pid || true)"
 
-    pid="$(get_root_xorg_pid || true)"
+    if [[ -n "$pid" ]]; then
+        if is_current_gpufan_xorg "$pid" && nvsettings_quiet -q gpus; then
+            echo "[OK] gpufan Xorg 已經運作中 (PID $pid)"
+            return
+        fi
 
-    if [[ -n "$pid" ]] && nvsettings_quiet -q gpus; then
-        echo "[OK] Root Xorg 已經運作中 (PID $pid)"
-        return
+        echo "[INFO] 偵測到舊版或無效的 gpufan Xorg，重新啟動..."
+        stop_existing_gpufan_xorg
     fi
 
-    ensure_xorg_config
-
     echo "[INFO] 停止 GDM..."
-
     systemctl stop gdm3.service 2>/dev/null || \
     systemctl stop gdm.service 2>/dev/null || true
 
@@ -202,12 +289,14 @@ start_xorg() {
 
     if pgrep -x Xorg >/dev/null 2>&1; then
         echo
-        echo "[ERROR] 系統還有 Xorg 正在執行："
+        echo "[ERROR] 系統仍有其他 Xorg 正在執行："
         pgrep -a Xorg
         echo
-        echo "請先確認沒有其他桌面/X Server 使用中。"
+        echo "gpufan 不會自動終止未知的 Xorg。"
         exit 1
     fi
+
+    generate_xorg_config
 
     echo "[INFO] 建立 Xauthority..."
     create_xauthority
@@ -224,12 +313,12 @@ start_xorg() {
     pid=$!
     echo "$pid" > "$XORG_PIDFILE"
 
-    for _ in {1..30}; do
+    for _ in {1..40}; do
         if ! kill -0 "$pid" 2>/dev/null; then
             echo
             echo "[ERROR] Xorg 提前終止"
             echo
-            tail -80 "$XORG_LOG" || true
+            tail -100 "$XORG_LOG" || true
             exit 1
         fi
 
@@ -244,49 +333,142 @@ start_xorg() {
     echo
     echo "[ERROR] Xorg 啟動逾時"
     echo
-    echo "最後 80 行 Log："
-    tail -80 "$XORG_LOG" || true
+    echo "最後 100 行 Log："
+    tail -100 "$XORG_LOG" || true
     exit 1
+}
+
+map_selected_gpu_target() {
+    get_selected_gpu_info
+
+    local target domain bus device func
+    local targets=()
+    NV_GPU_TARGET=""
+
+    mapfile -t targets < <(
+        nvsettings -q gpus 2>/dev/null |
+        sed -n 's/.*\[gpu:\([0-9]\+\)\].*/\1/p' |
+        sort -nu
+    )
+
+    for target in "${targets[@]}"; do
+        domain="$(nvsettings -t -q "[gpu:${target}]/PCIDomain" 2>/dev/null | head -n1 || true)"
+        bus="$(nvsettings -t -q "[gpu:${target}]/PCIBus" 2>/dev/null | head -n1 || true)"
+        device="$(nvsettings -t -q "[gpu:${target}]/PCIDevice" 2>/dev/null | head -n1 || true)"
+        func="$(nvsettings -t -q "[gpu:${target}]/PCIFunc" 2>/dev/null | head -n1 || true)"
+
+        [[ "$domain" =~ ^[0-9]+$ ]] || domain=0
+
+        if [[ "$bus" == "$SELECTED_BUS_DEC" &&
+              "$device" == "$SELECTED_DEVICE_DEC" &&
+              "$func" == "$SELECTED_FUNC_DEC" &&
+              "$domain" == "$SELECTED_DOMAIN_DEC" ]]; then
+            NV_GPU_TARGET="$target"
+            break
+        fi
+    done
+
+    [[ -n "$NV_GPU_TARGET" ]] || \
+        die "Xorg 中找不到與 nvidia-smi GPU $GPU_INDEX ($SELECTED_GPU_PCI) 對應的 GPU target"
+}
+
+detect_fans() {
+    FANS=()
+
+    local verbose
+    local gpu_count
+
+    verbose="$(nvsettings -q fans --verbose 2>/dev/null || true)"
+
+    mapfile -t FANS < <(
+        awk -v target="$NV_GPU_TARGET" '
+            /\[fan:[0-9]+\]/ {
+                line=$0
+                sub(/^.*\[fan:/, "", line)
+                sub(/\].*$/, "", line)
+                fan=line
+            }
+            /Is connected to the following GPU:/ {
+                connected=1
+                next
+            }
+            connected && /\[gpu:[0-9]+\]/ {
+                line=$0
+                sub(/^.*\[gpu:/, "", line)
+                sub(/\].*$/, "", line)
+                gpu=line
+                if (gpu == target && fan != "") print fan
+                connected=0
+            }
+            /Is not connected to any GPU/ {
+                connected=0
+            }
+        ' <<< "$verbose" |
+        sort -nu
+    )
+
+    if [[ ${#FANS[@]} -eq 0 ]]; then
+        gpu_count="$(
+            nvsettings -q gpus 2>/dev/null |
+            sed -n 's/.*\[gpu:\([0-9]\+\)\].*/\1/p' |
+            sort -nu |
+            wc -l
+        )"
+
+        if [[ "$gpu_count" -eq 1 ]]; then
+            mapfile -t FANS < <(
+                nvsettings -q fans 2>/dev/null |
+                sed -n 's/.*\[fan:\([0-9]\+\)\].*/\1/p' |
+                sort -nu
+            )
+        fi
+    fi
+
+    if [[ ${#FANS[@]} -eq 0 ]]; then
+        echo "[ERROR] 無法安全判斷 GPU $GPU_INDEX 對應的 fan targets。"
+        echo "[INFO] nvidia-settings fan mapping："
+        nvsettings -q fans --verbose 2>/dev/null || true
+        exit 1
+    fi
 }
 
 set_fan_speed() {
     local speed="$1"
     local output
 
-    if [[ ! "$speed" =~ ^[0-9]+$ ]]; then
-        die "風扇速度必須是 0~100 的整數"
-    fi
+    [[ "$speed" =~ ^[0-9]+$ ]] || die "風扇速度必須是 0~100 的整數"
 
     if (( speed < 0 || speed > 100 )); then
         die "風扇速度必須介於 0~100"
     fi
 
+    validate_gpu_index
     start_xorg
+    map_selected_gpu_target
     detect_fans
 
-    echo "[INFO] 偵測到 ${#FANS[@]} 個可控制風扇：${FANS[*]}"
+    echo "[INFO] GPU $GPU_INDEX：$SELECTED_GPU_NAME"
+    echo "[INFO] PCI Bus：$SELECTED_GPU_PCI"
+    echo "[INFO] Xorg GPU target：gpu:$NV_GPU_TARGET"
+    echo "[INFO] 對應風扇：${FANS[*]}"
     echo "[INFO] 啟用 NVIDIA 手動風扇控制..."
 
-    if ! output="$(
-        nvsettings -a '[gpu:0]/GPUFanControlState=1' 2>&1
-    )"; then
+    if ! output="$(nvsettings -a "[gpu:${NV_GPU_TARGET}]/GPUFanControlState=1" 2>&1)"; then
         echo "$output"
-        die "無法啟用手動風扇控制"
+        die "無法啟用 GPU $GPU_INDEX 的手動風扇控制"
     fi
 
     for fan in "${FANS[@]}"; do
-        echo "[INFO] Fan ${fan} -> ${speed}%"
+        echo "[INFO] GPU $GPU_INDEX / Fan ${fan} -> ${speed}%"
 
-        if ! output="$(
-            nvsettings -a "[fan:${fan}]/GPUTargetFanSpeed=${speed}" 2>&1
-        )"; then
+        if ! output="$(nvsettings -a "[fan:${fan}]/GPUTargetFanSpeed=${speed}" 2>&1)"; then
             echo "$output"
             die "Fan ${fan} 設定失敗"
         fi
     done
 
     echo
-    echo "[OK] ${#FANS[@]} 個 NVIDIA 風扇已設定為 ${speed}%"
+    echo "[OK] GPU $GPU_INDEX 的 ${#FANS[@]} 個風扇已設定為 ${speed}%"
 
     show_status
 }
@@ -294,31 +476,34 @@ set_fan_speed() {
 set_auto() {
     local output
 
+    validate_gpu_index
     start_xorg
+    map_selected_gpu_target
 
+    echo "[INFO] GPU $GPU_INDEX：$SELECTED_GPU_NAME"
     echo "[INFO] 恢復 NVIDIA 自動風扇控制..."
 
-    if ! output="$(
-        nvsettings -a '[gpu:0]/GPUFanControlState=0' 2>&1
-    )"; then
+    if ! output="$(nvsettings -a "[gpu:${NV_GPU_TARGET}]/GPUFanControlState=0" 2>&1)"; then
         echo "$output"
-        die "無法恢復自動風扇控制"
+        die "無法恢復 GPU $GPU_INDEX 的自動風扇控制"
     fi
 
     echo
-    echo "[OK] 已恢復 NVIDIA 自動風扇控制"
+    echo "[OK] GPU $GPU_INDEX 已恢復 NVIDIA 自動風扇控制"
 
     show_status
 }
 
 show_status() {
+    validate_gpu_index
+
     echo
     echo "========================================"
-    echo " GPU"
+    echo " GPU $GPU_INDEX"
     echo "========================================"
 
-    nvidia-smi \
-        --query-gpu=name,temperature.gpu,fan.speed,power.draw \
+    nvidia-smi -i "$GPU_INDEX" \
+        --query-gpu=index,name,pci.bus_id,temperature.gpu,fan.speed,power.draw \
         --format=csv,noheader 2>/dev/null || true
 
     echo
@@ -327,87 +512,68 @@ show_status() {
     echo "========================================"
 
     if ! nvsettings_quiet -q gpus; then
-        echo "Xorg / NV-CONTROL 尚未啟動"
+        echo "gpufan Xorg / NV-CONTROL 尚未啟動"
         return
     fi
 
+    map_selected_gpu_target
     detect_fans
 
     local state
     state="$(
-        nvsettings -t \
-            -q '[gpu:0]/GPUFanControlState' \
-            2>/dev/null || echo "?"
+        nvsettings -t -q "[gpu:${NV_GPU_TARGET}]/GPUFanControlState" 2>/dev/null |
+        head -n1 || true
     )"
 
     case "$state" in
-        1)
-            echo "模式：手動"
-            ;;
-        0)
-            echo "模式：自動"
-            ;;
-        *)
-            echo "模式：未知 ($state)"
-            ;;
+        1) echo "模式：手動" ;;
+        0) echo "模式：自動" ;;
+        *) echo "模式：未知 (${state:-?})" ;;
     esac
 
-    echo
-    echo "偵測到風扇：${FANS[*]}"
+    echo "Xorg GPU target：gpu:$NV_GPU_TARGET"
+    echo "風扇 targets：${FANS[*]}"
     echo
 
     for fan in "${FANS[@]}"; do
-        local target
-        local rpm
+        local target rpm
 
         target="$(
-            nvsettings -t \
-                -q "[fan:${fan}]/GPUTargetFanSpeed" \
-                2>/dev/null || echo "?"
+            nvsettings -t -q "[fan:${fan}]/GPUTargetFanSpeed" 2>/dev/null |
+            head -n1 || true
         )"
 
         rpm="$(
-            nvsettings -t \
-                -q "[fan:${fan}]/GPUCurrentFanSpeedRPM" \
-                2>/dev/null || echo "?"
+            nvsettings -t -q "[fan:${fan}]/GPUCurrentFanSpeedRPM" 2>/dev/null |
+            head -n1 || true
         )"
 
-        echo "Fan ${fan}: Target=${target}%  RPM=${rpm}"
+        echo "Fan ${fan}: Target=${target:-?}%  RPM=${rpm:-?}"
     done
 }
 
 stop_xorg() {
-    echo "[INFO] 恢復 NVIDIA 自動風扇控制..."
+    local pid
+    pid="$(get_gpufan_xorg_pid || true)"
 
-    if nvsettings_quiet -q gpus; then
-        nvsettings \
-            -a '[gpu:0]/GPUFanControlState=0' \
-            >/dev/null 2>&1 || true
+    if [[ -z "$pid" ]]; then
+        echo "[INFO] gpufan Xorg 尚未執行"
+        rm -f "$XORG_PIDFILE" "$XAUTH_FILE" "$XORG_CONFIG"
+        return
     fi
 
-    if [[ -f "$XORG_PIDFILE" ]]; then
-        local pid
-        pid="$(cat "$XORG_PIDFILE")"
+    echo "[INFO] 恢復所有 Xorg NVIDIA GPU 的自動風扇控制..."
+    restore_all_auto_if_possible
 
-        if kill -0 "$pid" 2>/dev/null; then
-            echo "[INFO] 關閉 gpufan Xorg (PID $pid)..."
+    echo "[INFO] 關閉 gpufan Xorg (PID $pid)..."
+    kill "$pid" 2>/dev/null || true
 
-            kill "$pid" 2>/dev/null || true
+    for _ in {1..20}; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.25
+    done
 
-            for _ in {1..20}; do
-                if ! kill -0 "$pid" 2>/dev/null; then
-                    break
-                fi
-                sleep 0.25
-            done
-        fi
-
-        rm -f "$XORG_PIDFILE"
-    else
-        echo "[INFO] 沒有找到 gpufan 的 Xorg PID file"
-    fi
-
-    rm -f "$XAUTH_FILE"
+    rm -f "$XORG_PIDFILE" "$XAUTH_FILE" "$XORG_CONFIG"
 
     echo "[OK] gpufan Xorg 已停止"
 }
@@ -416,48 +582,107 @@ restore_gui() {
     stop_xorg
 
     echo "[INFO] 啟動 GDM..."
-
-    systemctl start gdm3.service 2>/dev/null || \
-    systemctl start gdm.service
+    systemctl start gdm3.service 2>/dev/null || systemctl start gdm.service
 
     echo "[OK] GDM 已啟動"
 }
 
 usage() {
-    cat <<EOF
+    cat <<'EOF'
 
 NVIDIA GPU Fan Controller for Headless Ubuntu
 
 使用方法：
 
   gpufan 99
-      固定所有 NVIDIA 可控制風扇為 99%
+      將 GPU 0 的所有可控制風扇固定為 99%
 
-  gpufan 80
-      固定所有風扇為 80%
+  gpufan --gpu 1 80
+      將 GPU 1 的風扇固定為 80%
 
-  gpufan auto
-      恢復 NVIDIA 自動風扇控制
+  gpufan --gpu 2 status
+      查看 GPU 2 的 GPU / Fan 狀態
 
-  gpufan status
-      查看 GPU / Fan 狀態
+  gpufan --gpu 1 auto
+      只恢復 GPU 1 的 NVIDIA 自動風扇控制
+
+  gpufan list
+      列出 nvidia-smi 中所有 GPU index、型號與 PCI Bus
 
   gpufan stop
-      恢復自動風扇並停止 root Xorg
+      將所有已載入 GPU 恢復自動風扇控制，並停止 gpufan Xorg
 
   gpufan gui
-      恢復自動風扇、停止 root Xorg、重新啟動 Ubuntu GDM GUI
+      執行 stop 後重新啟動 Ubuntu GDM GUI
 
-首次執行：
-  若 /etc/X11/xorg.conf 不存在，gpufan 會自動偵測 GPU 0 的 PCI Bus，
-  並建立包含 Coolbits=4 與 AllowEmptyInitialConfiguration 的 Headless Xorg 設定。
+選項：
+
+  -g N, --gpu N, --gpu=N
+      指定 nvidia-smi GPU index，預設為 0
+
+範例：
+
+  gpufan 99
+  gpufan --gpu 0 99
+  gpufan --gpu 1 75
+  gpufan -g 2 status
+  gpufan --gpu 1 auto
+  gpufan list
 
 EOF
 }
 
-check_commands
+parse_args() {
+    while (( $# > 0 )); do
+        case "$1" in
+            -g|--gpu)
+                (( $# >= 2 )) || die "$1 後面需要 GPU index"
+                GPU_INDEX="$2"
+                shift 2
+                ;;
+            --gpu=*)
+                GPU_INDEX="${1#*=}"
+                shift
+                ;;
+            -h|--help)
+                ACTION="help"
+                shift
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -*)
+                die "未知選項：$1"
+                ;;
+            *)
+                if [[ -n "$ACTION" ]]; then
+                    die "一次只能指定一個動作或風扇速度"
+                fi
+                ACTION="$1"
+                shift
+                ;;
+        esac
+    done
 
-case "${1:-}" in
+    while (( $# > 0 )); do
+        if [[ -n "$ACTION" ]]; then
+            die "一次只能指定一個動作或風扇速度"
+        fi
+        ACTION="$1"
+        shift
+    done
+
+    ACTION="${ACTION:-help}"
+}
+
+check_commands
+parse_args "$@"
+
+case "$ACTION" in
+    list)
+        list_gpus
+        ;;
     auto)
         set_auto
         ;;
@@ -470,10 +695,10 @@ case "${1:-}" in
     gui)
         restore_gui
         ;;
-    "")
+    help)
         usage
         ;;
     *)
-        set_fan_speed "$1"
+        set_fan_speed "$ACTION"
         ;;
 esac
