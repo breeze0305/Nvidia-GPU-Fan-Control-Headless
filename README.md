@@ -4,25 +4,29 @@
 
 A lightweight Bash utility for controlling NVIDIA GPU fan speeds on **headless Ubuntu servers** over SSH.
 
-It uses `nvidia-settings` with a dedicated root Xorg session, automatically detects the fan controllers exposed by the NVIDIA driver, and supports fixed fan speeds, status monitoring, restoring automatic fan control, and restoring GDM when needed.
+It uses `nvidia-settings` with a dedicated root Xorg session, automatically detects NVIDIA fan controllers, supports **multiple GPUs with `--gpu N`**, and can restore NVIDIA automatic fan control or the Ubuntu GDM graphical login when needed.
 
 > Designed primarily for headless / SSH Ubuntu systems where NVIDIA fan control through the normal GDM Xorg session may fail.
 
 ## Features
 
 - Designed for headless Ubuntu / SSH servers
-- Automatically detects available NVIDIA fan controllers
-- Automatically generates a minimal headless `/etc/X11/xorg.conf` when one does not exist
-- Automatically detects the PCI Bus ID of `gpu:0`
-- Enables `Coolbits=4` and `AllowEmptyInitialConfiguration` in the generated Xorg config
-- Never overwrites an existing `/etc/X11/xorg.conf`
-- Set all detected GPU fans to a fixed speed
-- Restore NVIDIA automatic fan control
+- Supports **multiple NVIDIA GPUs**
+- Select a GPU using the same index shown by `nvidia-smi`
+- Defaults to **GPU 0** when `--gpu` is omitted
+- Automatically maps the selected `nvidia-smi` GPU to the correct `nvidia-settings` GPU target using its PCI Bus ID
+- Automatically discovers the fan targets connected to the selected GPU
+- Avoids assuming that `fan:0` belongs to `gpu:0`
+- Generates a temporary multi-GPU headless Xorg configuration under `/run`
+- Does **not** overwrite `/etc/X11/xorg.conf`
+- Enables `Coolbits=4` and `AllowEmptyInitialConfiguration` in the temporary Xorg configuration
+- Set all detected fans of one GPU to a fixed speed
+- Restore automatic fan control for one selected GPU
 - View GPU temperature, fan percentage, power draw, target fan speed, and RPM
-- Automatically starts a dedicated root Xorg session when required
-- Stops GDM before starting the dedicated Xorg session
-- Can restore the Ubuntu graphical login screen with one command
-- No need to hard-code the number of GPU fans
+- Stop the dedicated Xorg session and restore all loaded GPUs to automatic fan control
+- Restore Ubuntu GDM with one command
+
+## Tested GPUs
 
 Tested with NVIDIA GPUs across multiple RTX generations:
 
@@ -31,17 +35,23 @@ Tested with NVIDIA GPUs across multiple RTX generations:
 - NVIDIA GeForce RTX 4090
 - NVIDIA GeForce RTX 5090
 
-The number of controllable `fan:X` targets depends on the GPU model and NVIDIA driver.
+The number and numbering of controllable `fan:X` targets depend on the GPU model and NVIDIA driver.
+
+## Supported Ubuntu Versions
+
+- Ubuntu 20.04
+- Ubuntu 22.04
+- Ubuntu 24.04
 
 ## Requirements
 
-- Ubuntu 20.04 - 24.04
 - NVIDIA proprietary driver
 - `nvidia-smi`
 - `nvidia-settings`
 - Xorg
 - `xauth`
 - `mcookie`
+- sudo/root access
 
 Install the required packages if needed:
 
@@ -49,24 +59,6 @@ Install the required packages if needed:
 sudo apt update
 sudo apt install nvidia-settings xserver-xorg xauth
 ```
-
-### Xorg configuration
-
-You do **not** need to manually create `/etc/X11/xorg.conf` on a fresh headless system.
-
-If the file does not exist, `gpufan` automatically:
-
-1. Reads the PCI Bus ID of `gpu:0` from `nvidia-smi`
-2. Converts it to the Xorg `BusID` format
-3. Creates a minimal headless Xorg configuration
-4. Enables:
-
-```text
-Option "Coolbits" "4"
-Option "AllowEmptyInitialConfiguration" "True"
-```
-
-If `/etc/X11/xorg.conf` already exists, `gpufan` will **not overwrite it**. The existing NVIDIA device configuration should have `Coolbits=4` enabled for manual fan control.
 
 ## Installation
 
@@ -83,7 +75,7 @@ Install the script system-wide:
 sudo install -m 0755 gpufan /usr/local/bin/gpufan
 ```
 
-Verify the installation:
+Verify:
 
 ```bash
 which gpufan
@@ -95,105 +87,162 @@ Expected output:
 /usr/local/bin/gpufan
 ```
 
-You can now immediately run:
+## Quick Start
+
+List all NVIDIA GPUs:
+
+```bash
+gpufan list
+```
+
+Example:
+
+```text
+========================================
+ NVIDIA GPUs
+========================================
+0, NVIDIA GeForce RTX 4090, 00000000:01:00.0
+1, NVIDIA GeForce RTX 3090, 00000000:41:00.0
+```
+
+Set GPU 0 to 99% fan speed:
 
 ```bash
 gpufan 99
 ```
 
-On the first run, a headless Xorg configuration will be generated automatically if one is missing.
+This is equivalent to:
+
+```bash
+gpufan --gpu 0 99
+```
+
+Set GPU 1 to 80%:
+
+```bash
+gpufan --gpu 1 80
+```
+
+Short form:
+
+```bash
+gpufan -g 1 80
+```
 
 ## Usage
 
-Set all detected GPU fans to 99%:
+### Set fan speed
 
 ```bash
 gpufan 99
+gpufan --gpu 1 80
+gpufan --gpu=2 70
 ```
 
-Set all detected GPU fans to 80%:
+### Show status
 
-```bash
-gpufan 80
-```
-
-View the current GPU and fan status:
+GPU 0:
 
 ```bash
 gpufan status
 ```
 
-Restore NVIDIA automatic fan control:
+GPU 1:
+
+```bash
+gpufan --gpu 1 status
+```
+
+### Restore automatic fan control
+
+GPU 0:
 
 ```bash
 gpufan auto
 ```
 
-Restore automatic fan control and stop the dedicated root Xorg session:
+GPU 1 only:
+
+```bash
+gpufan --gpu 1 auto
+```
+
+### Stop gpufan Xorg
 
 ```bash
 gpufan stop
 ```
 
-Restore the Ubuntu GUI / GDM:
+This restores automatic fan control for all GPUs currently loaded by the gpufan Xorg session, then stops the dedicated Xorg server.
+
+### Restore Ubuntu GUI / GDM
 
 ```bash
 gpufan gui
 ```
 
-## First-run Example
+## Multi-GPU Design
 
-```text
-$ gpufan 99
+The GPU index supplied to `--gpu` is the **`nvidia-smi` GPU index**.
 
-[INFO] /etc/X11/xorg.conf not found
-[INFO] Detecting GPU 0 PCI Bus and creating a headless Xorg configuration...
-[OK] Created /etc/X11/xorg.conf
-[INFO] GPU: NVIDIA GeForce RTX 3090
-[INFO] PCI Bus: 00000000:01:00.0 -> PCI:1:0:0
-[INFO] Stopping GDM...
-[INFO] Creating Xauthority...
-[INFO] Starting root Xorg :0...
-[OK] Xorg started
-[INFO] Detected 2 controllable fans: 0 1
-[INFO] Enabling NVIDIA manual fan control...
-[INFO] Fan 0 -> 99%
-[INFO] Fan 1 -> 99%
+It is intentionally not assumed to be the same as the internal `nvidia-settings` target number.
 
-[OK] 2 NVIDIA fans have been set to 99%
+For example:
+
+```bash
+gpufan --gpu 1 99
 ```
 
-A GPU exposing three independent fan targets may instead show:
+works approximately as follows:
+
+1. Read GPU 1 from `nvidia-smi`
+2. Read its PCI Bus ID
+3. Start a dedicated Xorg session containing all detected NVIDIA GPUs
+4. Query the PCI domain, bus, device, and function of each `nvidia-settings` GPU target
+5. Match the correct Xorg GPU target by PCI address
+6. Query `nvidia-settings -q fans --verbose`
+7. Find only the fan targets connected to that GPU
+8. Enable manual fan control for that GPU
+9. Set only those fan targets to the requested speed
+
+This is important because fan target numbering can be global across the X server. On a multi-GPU machine, `fan:0` is not guaranteed to belong to `gpu:0`.
+
+## Xorg Configuration
+
+gpufan creates its own runtime Xorg configuration:
 
 ```text
-Detected 3 controllable fans: 0 1 2
+/run/gpufan-xorg.conf
 ```
 
-## How It Works
+The generated configuration contains all NVIDIA GPUs reported by `nvidia-smi` and automatically includes:
 
-On some Ubuntu systems, the Xorg session started by GDM can read NVIDIA fan information but fails when writing `GPUTargetFanSpeed`.
+```text
+Option "Coolbits" "4"
+Option "AllowEmptyInitialConfiguration" "True"
+```
 
-This utility works around that behavior by:
+The runtime configuration is built from each GPU's PCI Bus ID.
 
-1. Creating a minimal headless Xorg configuration when one is missing
-2. Detecting the PCI Bus ID of `gpu:0`
-3. Stopping GDM
-4. Starting a dedicated Xorg session as root
-5. Connecting `nvidia-settings` to that X server
-6. Enabling `GPUFanControlState`
-7. Detecting available `fan:X` targets
-8. Setting every detected fan target to the requested speed
+gpufan does **not** overwrite:
+
+```text
+/etc/X11/xorg.conf
+```
+
+The temporary configuration is removed when `gpufan stop` is used and is naturally cleared after reboot because it is stored under `/run`.
 
 ## Important Notes
 
-- The script currently controls `gpu:0`.
-- Automatic Xorg config generation also targets `gpu:0`.
-- Existing `/etc/X11/xorg.conf` files are never overwritten automatically.
+- `--gpu N` uses the GPU index shown by `nvidia-smi`.
+- If `--gpu` is omitted, GPU 0 is used.
+- Fan target numbers do not necessarily match GPU numbers.
 - The physical number of fans on a graphics card may differ from the number of fan controllers exposed by the NVIDIA driver.
-- Running `gpufan <speed>` may stop the current Ubuntu graphical desktop because GDM is stopped before the dedicated root Xorg session starts.
-- Use `gpufan gui` to stop the dedicated Xorg session and restore GDM.
+- gpufan refuses to guess fan ownership on a multi-GPU system when NVIDIA does not provide a safe fan-to-GPU mapping.
+- Starting gpufan stops GDM so the dedicated root Xorg server can take control.
+- Use `gpufan gui` to stop gpufan Xorg and restore GDM.
 - Fan settings may reset after reboot.
-- This tool is intended primarily for machines managed through SSH / headless environments.
+- This tool is intended primarily for desktop NVIDIA GPUs in headless / SSH-managed Ubuntu systems.
 
 ## Disclaimer
 
